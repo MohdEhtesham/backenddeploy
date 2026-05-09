@@ -10,8 +10,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: 10000
+      # PORT is automatically set by Render — do NOT hardcode it here.
+      # The app reads process.env.PORT and listens on whatever Render allocates.
       - key: MONGODB_URI
         sync: false
       - key: JWT_SECRET

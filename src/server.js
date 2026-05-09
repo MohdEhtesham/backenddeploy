@@ -1,3 +1,14 @@
+// Catch any error that escapes the rest of the app — print, then exit.
+// Without these, an unhandled rejection would silently crash with no log.
+process.on('uncaughtException', err => {
+  console.error('[fatal] uncaughtException:', err);
+  process.exit(1);
+});
+process.on('unhandledRejection', reason => {
+  console.error('[fatal] unhandledRejection:', reason);
+  process.exit(1);
+});
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -19,6 +30,10 @@ const sellerRoutes = require('./routes/seller.routes');
 const uploadRoutes = require('./routes/upload.routes');
 
 const app = express();
+
+// Render / most PaaS hosts run behind a proxy. Trust it so req.ip etc work
+// and rate-limit can read the X-Forwarded-For header.
+app.set('trust proxy', 1);
 
 app.use(helmet());
 app.use(
@@ -57,15 +72,35 @@ app.use(notFound);
 app.use(errorHandler);
 
 (async () => {
+  console.log(`[server] starting (node ${process.version}, env ${env.NODE_ENV})`);
+
   try {
     await connectDB();
-    app.listen(env.PORT, () => {
-      console.log(`[server] Aabroo API listening on :${env.PORT} (${env.NODE_ENV})`);
-    });
   } catch (err) {
-    console.error('[server] Failed to start:', err);
+    console.error('[server] DB connection failed:', err.message);
     process.exit(1);
   }
+
+  // Render assigns PORT dynamically. Bind to 0.0.0.0 so external traffic reaches us.
+  const server = app.listen(env.PORT, '0.0.0.0', () => {
+    console.log(`[server] Aabroo API listening on :${env.PORT} (${env.NODE_ENV})`);
+    console.log(`[server] health check: http://0.0.0.0:${env.PORT}/health`);
+  });
+
+  // listen() errors (port-in-use, permission denied, etc) emit on the server, not throw
+  server.on('error', err => {
+    console.error('[server] listen error:', err);
+    process.exit(1);
+  });
+
+  // Graceful shutdown so DB connections close cleanly on Render redeploys
+  const shutdown = signal => {
+    console.log(`[server] received ${signal}, shutting down`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 10000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 })();
 
 module.exports = app;
