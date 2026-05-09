@@ -2,9 +2,21 @@ const Property = require('../models/Property');
 const { ok, ApiError } = require('../utils/respond');
 const asyncHandler = require('../utils/asyncHandler');
 
+const escapeRegex = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 function buildFilter(q) {
   const filter = { status: { $ne: 'draft' } };
-  if (q.city) filter.city = q.city;
+  if (q.city) {
+    // Case-insensitive exact-ish match — Nominatim sometimes returns city
+    // names with slightly different casing than the seed data.
+    filter.city = new RegExp(`^${escapeRegex(String(q.city))}$`, 'i');
+  }
+  if (q.locality) {
+    // Localities are matched as substring (case-insensitive) so a Nominatim
+    // result like "Powai" finds listings whose locality is "Powai East"
+    // or vice versa.
+    filter.locality = new RegExp(escapeRegex(String(q.locality)), 'i');
+  }
   if (q.types) {
     const arr = Array.isArray(q.types) ? q.types : String(q.types).split(',');
     filter.type = { $in: arr };
