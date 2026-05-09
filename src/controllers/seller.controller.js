@@ -1,7 +1,41 @@
 const Property = require('../models/Property');
 const Lead = require('../models/Lead');
+const Visit = require('../models/Visit');
+const Notification = require('../models/Notification');
 const { ok, created, ApiError } = require('../utils/respond');
 const asyncHandler = require('../utils/asyncHandler');
+
+// Shape a Visit for the seller-facing API: flatten the populated buyer
+// (consumerId) into top-level buyer* fields so the mobile client doesn't
+// need to know about the populate plumbing.
+const toSellerVisit = visit => {
+  const obj = visit.toObject({ virtuals: false });
+  const buyer = obj.consumerId && typeof obj.consumerId === 'object' ? obj.consumerId : null;
+  return {
+    id: String(obj._id),
+    propertyId: String(obj.propertyId),
+    propertyTitle: obj.propertyTitle,
+    propertyImage: obj.propertyImage,
+    propertyLocation: obj.propertyLocation,
+    date: obj.date,
+    timeSlot: obj.timeSlot,
+    mode: obj.mode,
+    status: obj.status,
+    notes: obj.notes,
+    advisorName: obj.advisorName,
+    createdAt: obj.createdAt,
+    updatedAt: obj.updatedAt,
+    buyer: buyer
+      ? {
+          id: String(buyer._id),
+          fullName: buyer.fullName,
+          phone: buyer.phone,
+          email: buyer.email,
+          avatar: buyer.avatar,
+        }
+      : null,
+  };
+};
 
 // ===== LISTINGS =====
 exports.myListings = asyncHandler(async (req, res) => {
@@ -94,6 +128,43 @@ exports.setLeadStatus = asyncHandler(async (req, res) => {
   );
   if (!lead) throw new ApiError(404, 'Lead not found');
   ok(res, lead.toPublic());
+});
+
+// ===== VISITS (seller view) =====
+exports.visits = asyncHandler(async (req, res) => {
+  const visits = await Visit.find({ propertyOwnerId: req.user._id })
+    .populate('consumerId', 'fullName phone email avatar')
+    .sort({ date: 1 });
+  ok(res, visits.map(toSellerVisit));
+});
+
+exports.setVisitStatus = asyncHandler(async (req, res) => {
+  const status = req.body.status;
+  if (!['upcoming', 'completed', 'cancelled', 'rescheduled'].includes(status)) {
+    throw new ApiError(400, 'Invalid status');
+  }
+  const visit = await Visit.findOneAndUpdate(
+    { _id: req.params.id, propertyOwnerId: req.user._id },
+    { status },
+    { new: true },
+  ).populate('consumerId', 'fullName phone email avatar');
+  if (!visit) throw new ApiError(404, 'Visit not found');
+
+  // Tell the buyer about meaningful state changes so they're not in the dark.
+  if (status === 'cancelled' || status === 'completed') {
+    Notification.create({
+      userId: visit.consumerId?._id || visit.consumerId,
+      type: 'visit_reminder',
+      title: status === 'cancelled' ? 'Visit cancelled by host' : 'Visit marked as completed',
+      body:
+        status === 'cancelled'
+          ? `Your visit for "${visit.propertyTitle}" was cancelled by the seller.`
+          : `Your visit for "${visit.propertyTitle}" has been marked completed.`,
+      actionId: String(visit._id),
+    }).catch(() => {});
+  }
+
+  ok(res, toSellerVisit(visit));
 });
 
 // ===== ANALYTICS =====

@@ -16,6 +16,10 @@ router.delete('/listings/:id', ctrl.deleteListing);
 router.get('/leads', ctrl.leads);
 router.put('/leads/:id/status', ctrl.setLeadStatus);
 
+// Visits (booked on this seller's listings)
+router.get('/visits', ctrl.visits);
+router.put('/visits/:id/status', ctrl.setVisitStatus);
+
 // Analytics
 router.get('/analytics', ctrl.analytics);
 
