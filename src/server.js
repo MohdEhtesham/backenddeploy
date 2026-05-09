@@ -17,7 +17,7 @@ const rateLimit = require('express-rate-limit');
 const mongoose = require('mongoose');
 
 const env = require('./config/env');
-const { connectDB } = require('./config/db');
+const { connectDB, getStatus } = require('./config/db');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
 const { ok } = require('./utils/respond');
 
@@ -70,6 +70,17 @@ app.get('/health', (_req, res) =>
     db: mongoose.connection.readyState === 1 ? 'connected' : 'connecting',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
+  }),
+);
+
+// Sanitized DB diagnostics (no URI / no password) — for production debugging
+app.get('/diagnostics', (_req, res) =>
+  ok(res, {
+    db: getStatus(),
+    cloudinary: env.CLOUDINARY_ENABLED ? 'enabled' : 'disabled',
+    nodeEnv: env.NODE_ENV,
+    nodeVersion: process.version,
+    uptime: process.uptime(),
   }),
 );
 
