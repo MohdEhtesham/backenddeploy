@@ -29,6 +29,7 @@ const visitRoutes = require('./routes/visit.routes');
 const notificationRoutes = require('./routes/notification.routes');
 const chatRoutes = require('./routes/chat.routes');
 const sellerRoutes = require('./routes/seller.routes');
+const adminRoutes = require('./routes/admin.routes');
 const uploadRoutes = require('./routes/upload.routes');
 
 const app = express();
@@ -104,6 +105,7 @@ app.use('/api/visits', requireDb, visitRoutes);
 app.use('/api/notifications', requireDb, notificationRoutes);
 app.use('/api/chat', requireDb, chatRoutes);
 app.use('/api/seller', requireDb, sellerRoutes);
+app.use('/api/admin', requireDb, adminRoutes);
 app.use('/api/uploads', requireDb, uploadRoutes);
 
 app.use(notFound);

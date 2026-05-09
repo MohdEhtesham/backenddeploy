@@ -11,6 +11,7 @@ async function authRequired(req, _res, next) {
     const payload = verifyToken(token);
     const user = await User.findById(payload.sub);
     if (!user) throw new ApiError(401, 'Invalid token');
+    if (user.suspended) throw new ApiError(403, 'This account has been suspended.');
 
     req.user = user;
     next();
