@@ -20,6 +20,7 @@ const env = require('./config/env');
 const { connectDB, getStatus } = require('./config/db');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
 const { ok } = require('./utils/respond');
+const { attachSignaling } = require('./sockets/signaling');
 
 const authRoutes = require('./routes/auth.routes');
 const propertyRoutes = require('./routes/property.routes');
@@ -119,6 +120,16 @@ const server = app.listen(env.PORT, '0.0.0.0', () => {
   console.log(`[server] Aabroo API listening on :${env.PORT} (${env.NODE_ENV})`);
   console.log(`[server] health check: /health`);
 });
+
+// Mount the WebRTC signaling namespace on the same HTTP server. It does
+// not require DB to be ready; the join handler short-circuits with a
+// proper error if the visit lookup fails before Mongo is up.
+try {
+  attachSignaling(server);
+  console.log('[signaling] /visit-call namespace ready');
+} catch (e) {
+  console.error('[signaling] failed to attach', e);
+}
 
 server.on('error', err => {
   console.error('[server] listen error:', err);
