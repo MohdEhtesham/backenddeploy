@@ -187,8 +187,7 @@ exports.leads = asyncHandler(async (req, res) => {
       .sort({ createdAt: -1 }),
   ]);
 
-  // Index real leads by listing+buyer → array, so we can answer "is there
-  // already an active lead for this pair?" without looping per-visit.
+  // Index real leads by listing+buyer.
   const realByKey = new Map();
   for (const l of realLeads) {
     const k = `${String(l.listingId)}::${String(l.consumerId || '')}`;
@@ -196,11 +195,41 @@ exports.leads = asyncHandler(async (req, res) => {
     realByKey.get(k).push(l);
   }
 
-  // Also key existing visit promotions: a real lead may already encode a
-  // visit (after promotion via setLeadStatus). We dedupe via visitId.
+  // Index visits by listing+buyer so we can answer "is there a visit on this
+  // pair?" without nested loops.
+  const visitByPair = new Map();
+  for (const v of visits) {
+    const buyer = v.consumerId && typeof v.consumerId === 'object' ? v.consumerId : null;
+    if (!buyer) continue;
+    const k = `${String(v.propertyId)}::${String(buyer._id)}`;
+    if (!visitByPair.has(k)) visitByPair.set(k, []);
+    visitByPair.get(k).push(v);
+  }
+
+  // Real lead promotions: a real Lead may already encode a visit (after the
+  // synthetic-id promotion in setLeadStatus). Dedupe via visitId.
   const promotedVisitIds = new Set(
     realLeads.filter(l => l.visitId).map(l => String(l.visitId)),
   );
+
+  // Surface real leads, upgrading status to visit_booked when a matching
+  // visit exists and the lead is still in an early-funnel state. Visit
+  // progress should win over inquiry progress — otherwise an early 'new'
+  // lead would shadow the booking.
+  const surfacedReal = realLeads.map(l => {
+    const pub = l.toPublic();
+    const k = `${String(l.listingId)}::${String(l.consumerId || '')}`;
+    const matchingVisits = visitByPair.get(k) ?? [];
+    const isEarlyFunnel = pub.status === 'new' || pub.status === 'contacted';
+    if (matchingVisits.length && isEarlyFunnel) {
+      const v = matchingVisits[0];
+      const modeLabel = v.mode === 'virtual' ? 'Virtual tour' : 'In-person visit';
+      pub.status = 'visit_booked';
+      pub.message = `${modeLabel} scheduled for ${formatVisitDate(v.date)}, ${v.timeSlot}`;
+      pub.visitId = String(v._id);
+    }
+    return pub;
+  });
 
   const synthesized = [];
   for (const v of visits) {
@@ -210,15 +239,14 @@ exports.leads = asyncHandler(async (req, res) => {
     const k = `${String(v.propertyId)}::${String(buyer._id)}`;
     const matches = realByKey.get(k) ?? [];
     const hasActive = matches.some(m => isActiveLeadStatus(m.status));
-    if (hasActive) continue; // surface the existing real lead instead
+    if (hasActive) continue; // surfaced via the upgraded real lead above
     const synth = synthesizeVisitLead(v);
     if (synth) synthesized.push(synth);
   }
 
-  const merged = [
-    ...realLeads.map(l => l.toPublic()),
-    ...synthesized,
-  ].sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt));
+  const merged = [...surfacedReal, ...synthesized].sort(
+    (a, b) => +new Date(b.createdAt) - +new Date(a.createdAt),
+  );
 
   ok(res, merged);
 });
