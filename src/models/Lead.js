@@ -17,6 +17,10 @@ const LeadSchema = new mongoose.Schema(
       default: 'new',
       index: true,
     },
+    // Set when a Lead row was promoted from a Visit (via setLeadStatus on a
+    // visit-derived synthetic id). Used to dedupe between the synthesized
+    // visit-leads and real Lead rows in /seller/leads responses.
+    visitId: { type: mongoose.Schema.Types.ObjectId, ref: 'Visit', index: true },
   },
   { timestamps: true },
 );

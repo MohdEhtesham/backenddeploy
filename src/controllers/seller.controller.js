@@ -111,21 +111,31 @@ exports.deleteListing = asyncHandler(async (req, res) => {
 });
 
 // ===== LEADS =====
-// Lazy-backfill: every active visit booked on this seller's listings should
-// be reflected in the Leads pipeline.
 //
-// Dedupe rules:
-//   - If an ACTIVE Lead (new / contacted / visit_booked) already exists for
-//     this listing+buyer pair, upgrade it to visit_booked instead of
-//     creating a duplicate.
-//   - If only a TERMINAL Lead exists (closed_won / closed_lost), the seller
-//     has already closed that engagement, so the fresh visit is treated as
-//     a new engagement and a brand-new Lead is created.
-//   - If no Lead at all exists, create one.
+// Architecture (single source of truth):
+//   - Inquiries → real Lead documents (created in inquiry.controller).
+//   - Visits   → no separate Lead document is ever written. Instead, the
+//                /seller/leads endpoint synthesizes visit-derived lead rows
+//                on the fly from the Visit collection.
 //
-// This protects against bookings made before the visit→lead pipeline was
-// deployed and against any future gap (e.g. notification path silently
-// fails). The operation is idempotent.
+// Why this beats the previous "always write a Lead row" approach:
+//   1. Zero drift between Visit state and Lead state — there's only one
+//      collection backing each entity.
+//   2. Idempotent without writes — every GET reflects current truth.
+//   3. No timing/redeploy race: even if the visit was booked before the
+//      seller-side pipeline existed, it appears the next time the seller
+//      opens the Leads tab.
+//
+// Dedup rules between real leads and visits for the same buyer+listing pair:
+//   - If an ACTIVE real Lead exists (new / contacted / visit_booked), we
+//     trust that — it's likely the inquiry-driven row. We do NOT also
+//     synthesize a visit-derived row, to avoid showing the same buyer twice.
+//   - If only TERMINAL leads exist (closed_won / closed_lost), or no lead
+//     at all, a fresh visit is a new engagement and we synthesize a row.
+//
+// Promotion: the moment the seller acts on a visit-derived row (advances
+// status / changes status), setLeadStatus promotes it to a real Lead so
+// status history is preserved going forward.
 const formatVisitDate = date => {
   try {
     return new Date(date).toLocaleDateString('en-IN', {
@@ -138,75 +148,79 @@ const formatVisitDate = date => {
   }
 };
 
-const backfillLeadsFromVisits = async sellerId => {
-  const visits = await Visit.find({
-    propertyOwnerId: sellerId,
-    status: { $in: ['upcoming', 'completed', 'rescheduled'] },
-  }).populate('consumerId', 'fullName phone email avatar');
+const VISIT_LEAD_PREFIX = 'visit_';
+const isActiveLeadStatus = s => s === 'new' || s === 'contacted' || s === 'visit_booked';
 
-  if (!visits.length) return;
-
-  const existing = await Lead.find({ sellerId }).select('listingId consumerId status');
-  // Index by listing+buyer → array of leads, so we can distinguish "active
-  // lead exists" from "only terminal leads exist".
-  const byKey = new Map();
-  for (const l of existing) {
-    const k = `${String(l.listingId)}::${String(l.consumerId || '')}`;
-    if (!byKey.has(k)) byKey.set(k, []);
-    byKey.get(k).push(l);
-  }
-  const isActive = s => s === 'new' || s === 'contacted' || s === 'visit_booked';
-
-  const toCreate = [];
-  const toUpgrade = []; // existing leads whose status we want to bump
-
-  for (const v of visits) {
-    const buyer = v.consumerId && typeof v.consumerId === 'object' ? v.consumerId : null;
-    if (!buyer) continue;
-    const key = `${String(v.propertyId)}::${String(buyer._id)}`;
-    const matches = byKey.get(key) ?? [];
-    const activeMatch = matches.find(m => isActive(m.status));
-
-    const modeLabel = v.mode === 'virtual' ? 'Virtual tour' : 'In-person visit';
-    const message = `${modeLabel} scheduled for ${formatVisitDate(v.date)}, ${v.timeSlot}`;
-
-    if (activeMatch) {
-      if (activeMatch.status !== 'visit_booked') {
-        toUpgrade.push({ id: activeMatch._id, message });
-      }
-      continue;
-    }
-
-    // No active lead — either no lead at all, or only terminal leads exist.
-    // Create a fresh visit_booked lead either way.
-    toCreate.push({
-      sellerId,
-      listingId: v.propertyId,
-      listingTitle: v.propertyTitle,
-      listingImage: v.propertyImage,
-      consumerId: buyer._id,
-      consumerName: buyer.fullName,
-      consumerPhone: buyer.phone,
-      consumerEmail: buyer.email,
-      message,
-      status: 'visit_booked',
-    });
-    // Track so a second visit on the same pair in this batch doesn't
-    // create yet another duplicate within the same request.
-    matches.push({ status: 'visit_booked' });
-    byKey.set(key, matches);
-  }
-
-  if (toCreate.length) await Lead.insertMany(toCreate);
-  for (const u of toUpgrade) {
-    await Lead.updateOne({ _id: u.id }, { status: 'visit_booked', message: u.message });
-  }
+const synthesizeVisitLead = visit => {
+  const buyer = visit.consumerId && typeof visit.consumerId === 'object' ? visit.consumerId : null;
+  if (!buyer) return null;
+  const modeLabel = visit.mode === 'virtual' ? 'Virtual tour' : 'In-person visit';
+  return {
+    id: `${VISIT_LEAD_PREFIX}${visit._id}`,
+    visitId: String(visit._id),
+    isVisitDerived: true,
+    sellerId: String(visit.propertyOwnerId),
+    listingId: String(visit.propertyId),
+    listingTitle: visit.propertyTitle,
+    listingImage: visit.propertyImage,
+    consumerId: String(buyer._id),
+    consumerName: buyer.fullName,
+    consumerPhone: buyer.phone,
+    consumerEmail: buyer.email,
+    message: `${modeLabel} scheduled for ${formatVisitDate(visit.date)}, ${visit.timeSlot}`,
+    status: 'visit_booked',
+    createdAt: visit.createdAt,
+    updatedAt: visit.updatedAt,
+  };
 };
 
 exports.leads = asyncHandler(async (req, res) => {
-  await backfillLeadsFromVisits(req.user._id).catch(() => {});
-  const items = await Lead.find({ sellerId: req.user._id }).sort({ createdAt: -1 });
-  ok(res, items.map(l => l.toPublic()));
+  const sellerId = req.user._id;
+
+  const [realLeads, visits] = await Promise.all([
+    Lead.find({ sellerId }).sort({ createdAt: -1 }),
+    Visit.find({
+      propertyOwnerId: sellerId,
+      status: { $in: ['upcoming', 'completed', 'rescheduled'] },
+    })
+      .populate('consumerId', 'fullName phone email avatar')
+      .sort({ createdAt: -1 }),
+  ]);
+
+  // Index real leads by listing+buyer → array, so we can answer "is there
+  // already an active lead for this pair?" without looping per-visit.
+  const realByKey = new Map();
+  for (const l of realLeads) {
+    const k = `${String(l.listingId)}::${String(l.consumerId || '')}`;
+    if (!realByKey.has(k)) realByKey.set(k, []);
+    realByKey.get(k).push(l);
+  }
+
+  // Also key existing visit promotions: a real lead may already encode a
+  // visit (after promotion via setLeadStatus). We dedupe via visitId.
+  const promotedVisitIds = new Set(
+    realLeads.filter(l => l.visitId).map(l => String(l.visitId)),
+  );
+
+  const synthesized = [];
+  for (const v of visits) {
+    if (promotedVisitIds.has(String(v._id))) continue;
+    const buyer = v.consumerId && typeof v.consumerId === 'object' ? v.consumerId : null;
+    if (!buyer) continue;
+    const k = `${String(v.propertyId)}::${String(buyer._id)}`;
+    const matches = realByKey.get(k) ?? [];
+    const hasActive = matches.some(m => isActiveLeadStatus(m.status));
+    if (hasActive) continue; // surface the existing real lead instead
+    const synth = synthesizeVisitLead(v);
+    if (synth) synthesized.push(synth);
+  }
+
+  const merged = [
+    ...realLeads.map(l => l.toPublic()),
+    ...synthesized,
+  ].sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt));
+
+  ok(res, merged);
 });
 
 exports.setLeadStatus = asyncHandler(async (req, res) => {
@@ -214,8 +228,40 @@ exports.setLeadStatus = asyncHandler(async (req, res) => {
   if (!['new', 'contacted', 'visit_booked', 'closed_won', 'closed_lost'].includes(status)) {
     throw new ApiError(400, 'Invalid status');
   }
+
+  const id = req.params.id;
+
+  // Visit-derived synthetic id → promote to a real Lead so the change
+  // sticks. The Visit document keeps its own status separately (managed
+  // via /seller/visits/:id/status).
+  if (typeof id === 'string' && id.startsWith(VISIT_LEAD_PREFIX)) {
+    const visitId = id.slice(VISIT_LEAD_PREFIX.length);
+    const visit = await Visit.findOne({ _id: visitId, propertyOwnerId: req.user._id })
+      .populate('consumerId', 'fullName phone email avatar');
+    if (!visit) throw new ApiError(404, 'Visit not found');
+
+    const buyer = visit.consumerId && typeof visit.consumerId === 'object' ? visit.consumerId : null;
+    const modeLabel = visit.mode === 'virtual' ? 'Virtual tour' : 'In-person visit';
+
+    const lead = await Lead.create({
+      sellerId: req.user._id,
+      listingId: visit.propertyId,
+      listingTitle: visit.propertyTitle,
+      listingImage: visit.propertyImage,
+      consumerId: buyer?._id,
+      consumerName: buyer?.fullName,
+      consumerPhone: buyer?.phone,
+      consumerEmail: buyer?.email,
+      message: `${modeLabel} scheduled for ${formatVisitDate(visit.date)}, ${visit.timeSlot}`,
+      status,
+      visitId: visit._id,
+    });
+    ok(res, lead.toPublic());
+    return;
+  }
+
   const lead = await Lead.findOneAndUpdate(
-    { _id: req.params.id, sellerId: req.user._id },
+    { _id: id, sellerId: req.user._id },
     { status },
     { new: true },
   );

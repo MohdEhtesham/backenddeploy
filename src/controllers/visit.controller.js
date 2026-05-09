@@ -1,7 +1,6 @@
 const Visit = require('../models/Visit');
 const Property = require('../models/Property');
 const Notification = require('../models/Notification');
-const Lead = require('../models/Lead');
 const { ok, created, ApiError } = require('../utils/respond');
 const asyncHandler = require('../utils/asyncHandler');
 
@@ -68,40 +67,12 @@ exports.create = asyncHandler(async (req, res) => {
     actionId: String(visit._id),
   });
 
-  // For seller-listed properties also notify the owner and create/update a
-  // Lead so the booking shows up in their Leads tab with the right status.
-  if (property.ownerId && property.isUserListing) {
+  // For owner-bearing properties, notify the seller. We do NOT write a
+  // separate Lead row here — the /seller/leads endpoint synthesizes a
+  // visit-derived lead from the Visit document at read-time, so there's a
+  // single source of truth and no risk of drift.
+  if (property.ownerId) {
     const dateLabel = formatVisitDate(visit.date);
-    const modeLabel = visit.mode === 'virtual' ? 'Virtual tour' : 'In-person visit';
-    const visitMessage = `${modeLabel} scheduled for ${dateLabel}, ${visit.timeSlot}`;
-
-    // If we already have a lead from an earlier inquiry by the same buyer,
-    // update its status to visit_booked rather than duplicating.
-    const existing = await Lead.findOne({
-      sellerId: property.ownerId,
-      listingId: property._id,
-      consumerId: req.user._id,
-    });
-
-    if (existing) {
-      existing.status = 'visit_booked';
-      existing.message = visitMessage;
-      await existing.save();
-    } else {
-      await Lead.create({
-        sellerId: property.ownerId,
-        listingId: property._id,
-        listingTitle: property.title,
-        listingImage: property.images?.[0],
-        consumerId: req.user._id,
-        consumerName: req.user.fullName,
-        consumerPhone: req.user.phone,
-        consumerEmail: req.user.email,
-        message: visitMessage,
-        status: 'visit_booked',
-      });
-    }
-
     await Notification.create({
       userId: property.ownerId,
       type: 'visit_reminder',
