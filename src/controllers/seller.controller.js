@@ -111,7 +111,62 @@ exports.deleteListing = asyncHandler(async (req, res) => {
 });
 
 // ===== LEADS =====
+// Lazy-backfill: any visit booked on this seller's listings that doesn't
+// already have a matching Lead gets one created with status visit_booked.
+// This protects against bookings made before the visit→lead pipeline was
+// deployed and against any future gap (e.g. notification path failed).
+const backfillLeadsFromVisits = async sellerId => {
+  const visits = await Visit.find({
+    propertyOwnerId: sellerId,
+    status: { $in: ['upcoming', 'completed', 'rescheduled'] },
+  }).populate('consumerId', 'fullName phone email avatar');
+
+  if (!visits.length) return;
+
+  // Pull existing leads once and key by listingId+consumerId for O(1) lookup.
+  const existing = await Lead.find({ sellerId }).select('listingId consumerId');
+  const haveKey = new Set(
+    existing.map(l => `${String(l.listingId)}::${String(l.consumerId || '')}`),
+  );
+
+  const toCreate = [];
+  for (const v of visits) {
+    const buyerId = v.consumerId?._id ? String(v.consumerId._id) : String(v.consumerId);
+    const key = `${String(v.propertyId)}::${buyerId}`;
+    if (haveKey.has(key)) continue;
+    const buyer = v.consumerId && typeof v.consumerId === 'object' ? v.consumerId : null;
+    if (!buyer) continue;
+    const dateLabel = (() => {
+      try {
+        return new Date(v.date).toLocaleDateString('en-IN', {
+          weekday: 'short',
+          day: 'numeric',
+          month: 'short',
+        });
+      } catch {
+        return new Date(v.date).toISOString().slice(0, 10);
+      }
+    })();
+    const modeLabel = v.mode === 'virtual' ? 'Virtual tour' : 'In-person visit';
+    toCreate.push({
+      sellerId,
+      listingId: v.propertyId,
+      listingTitle: v.propertyTitle,
+      listingImage: v.propertyImage,
+      consumerId: buyer._id,
+      consumerName: buyer.fullName,
+      consumerPhone: buyer.phone,
+      consumerEmail: buyer.email,
+      message: `${modeLabel} scheduled for ${dateLabel}, ${v.timeSlot}`,
+      status: 'visit_booked',
+    });
+  }
+
+  if (toCreate.length) await Lead.insertMany(toCreate);
+};
+
 exports.leads = asyncHandler(async (req, res) => {
+  await backfillLeadsFromVisits(req.user._id).catch(() => {});
   const items = await Lead.find({ sellerId: req.user._id }).sort({ createdAt: -1 });
   ok(res, items.map(l => l.toPublic()));
 });
