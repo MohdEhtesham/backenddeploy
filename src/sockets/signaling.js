@@ -25,8 +25,11 @@
 const { Server } = require('socket.io');
 const { verifyToken } = require('../utils/jwt');
 const Visit = require('../models/Visit');
+const User = require('../models/User');
+const Notification = require('../models/Notification');
 
 const ROOM_PREFIX = 'visit:';
+const USER_ROOM = userId => `user:${userId}`;
 
 const attachSignaling = httpServer => {
   const io = new Server(httpServer, {
@@ -60,6 +63,42 @@ const attachSignaling = httpServer => {
   ns.on('connection', socket => {
     const userId = socket.data.userId;
 
+    // Every authenticated socket joins its own user room so we can target
+    // it directly for ring events without tracking a userId→socketId map.
+    socket.join(USER_ROOM(userId));
+
+    // Caller-side cancel: the joiner can tell us they're abandoning the
+    // attempt before the peer picks up. We forward to the peer so they can
+    // dismiss the incoming-call overlay.
+    socket.on('cancel-call', async ({ visitId } = {}) => {
+      if (!visitId) return;
+      try {
+        const visit = await Visit.findById(visitId).select('consumerId propertyOwnerId');
+        if (!visit) return;
+        const buyerId = String(visit.consumerId || '');
+        const ownerId = String(visit.propertyOwnerId || '');
+        const otherUserId = userId === buyerId ? ownerId : userId === ownerId ? buyerId : null;
+        if (otherUserId) {
+          ns.to(USER_ROOM(otherUserId)).emit('incoming-call-cancelled', { visitId });
+        }
+      } catch {}
+    });
+
+    // Callee-side decline: tell the caller the other party rejected.
+    socket.on('decline-call', async ({ visitId } = {}) => {
+      if (!visitId) return;
+      try {
+        const visit = await Visit.findById(visitId).select('consumerId propertyOwnerId');
+        if (!visit) return;
+        const buyerId = String(visit.consumerId || '');
+        const ownerId = String(visit.propertyOwnerId || '');
+        const otherUserId = userId === buyerId ? ownerId : userId === ownerId ? buyerId : null;
+        if (otherUserId) {
+          ns.to(USER_ROOM(otherUserId)).emit('call-declined', { visitId });
+        }
+      } catch {}
+    });
+
     socket.on('join', async ({ visitId } = {}, ack) => {
       if (!visitId || typeof visitId !== 'string') {
         ack?.({ ok: false, error: 'visitId required' });
@@ -69,7 +108,9 @@ const attachSignaling = httpServer => {
 
       let visit;
       try {
-        visit = await Visit.findById(visitId).select('consumerId propertyOwnerId mode status');
+        visit = await Visit.findById(visitId).select(
+          'consumerId propertyOwnerId mode status propertyTitle',
+        );
       } catch {
         ack?.({ ok: false, error: 'invalid visit' });
         socket.emit('error', { message: 'Invalid visit' });
@@ -103,6 +144,37 @@ const attachSignaling = httpServer => {
       // Tell the joiner who's already there so it can initiate offers.
       ack?.({ ok: true, self: socket.id, peers, role });
       socket.to(roomName).emit('peer-joined', { socketId: socket.id, role });
+
+      // If we were the first one in the room, ring the other party so they
+      // know a call is waiting. We target their user room (joined on
+      // socket connect), so any of their open clients picks up the event.
+      // We also create a persistent Notification as a fallback for clients
+      // that aren't online right now.
+      if (peers.length === 0) {
+        const otherUserId = userId === buyerId ? ownerId : buyerId;
+        if (otherUserId) {
+          let callerName = 'Someone';
+          try {
+            const me = await User.findById(userId).select('fullName');
+            if (me?.fullName) callerName = me.fullName;
+          } catch {}
+
+          ns.to(USER_ROOM(otherUserId)).emit('incoming-call', {
+            visitId,
+            callerName,
+            callerRole: role,
+            propertyTitle: visit.propertyTitle ?? undefined,
+          });
+
+          Notification.create({
+            userId: otherUserId,
+            type: 'visit_reminder',
+            title: 'Incoming virtual tour',
+            body: `${callerName} is waiting on the virtual tour for your visit. Tap to join.`,
+            actionId: visitId,
+          }).catch(() => {});
+        }
+      }
     });
 
     // Generic relay — `to` is a peer's socket id. We never inspect the
