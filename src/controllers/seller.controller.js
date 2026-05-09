@@ -111,10 +111,33 @@ exports.deleteListing = asyncHandler(async (req, res) => {
 });
 
 // ===== LEADS =====
-// Lazy-backfill: any visit booked on this seller's listings that doesn't
-// already have a matching Lead gets one created with status visit_booked.
+// Lazy-backfill: every active visit booked on this seller's listings should
+// be reflected in the Leads pipeline.
+//
+// Dedupe rules:
+//   - If an ACTIVE Lead (new / contacted / visit_booked) already exists for
+//     this listing+buyer pair, upgrade it to visit_booked instead of
+//     creating a duplicate.
+//   - If only a TERMINAL Lead exists (closed_won / closed_lost), the seller
+//     has already closed that engagement, so the fresh visit is treated as
+//     a new engagement and a brand-new Lead is created.
+//   - If no Lead at all exists, create one.
+//
 // This protects against bookings made before the visit→lead pipeline was
-// deployed and against any future gap (e.g. notification path failed).
+// deployed and against any future gap (e.g. notification path silently
+// fails). The operation is idempotent.
+const formatVisitDate = date => {
+  try {
+    return new Date(date).toLocaleDateString('en-IN', {
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+    });
+  } catch {
+    return new Date(date).toISOString().slice(0, 10);
+  }
+};
+
 const backfillLeadsFromVisits = async sellerId => {
   const visits = await Visit.find({
     propertyOwnerId: sellerId,
@@ -123,31 +146,39 @@ const backfillLeadsFromVisits = async sellerId => {
 
   if (!visits.length) return;
 
-  // Pull existing leads once and key by listingId+consumerId for O(1) lookup.
-  const existing = await Lead.find({ sellerId }).select('listingId consumerId');
-  const haveKey = new Set(
-    existing.map(l => `${String(l.listingId)}::${String(l.consumerId || '')}`),
-  );
+  const existing = await Lead.find({ sellerId }).select('listingId consumerId status');
+  // Index by listing+buyer → array of leads, so we can distinguish "active
+  // lead exists" from "only terminal leads exist".
+  const byKey = new Map();
+  for (const l of existing) {
+    const k = `${String(l.listingId)}::${String(l.consumerId || '')}`;
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(l);
+  }
+  const isActive = s => s === 'new' || s === 'contacted' || s === 'visit_booked';
 
   const toCreate = [];
+  const toUpgrade = []; // existing leads whose status we want to bump
+
   for (const v of visits) {
-    const buyerId = v.consumerId?._id ? String(v.consumerId._id) : String(v.consumerId);
-    const key = `${String(v.propertyId)}::${buyerId}`;
-    if (haveKey.has(key)) continue;
     const buyer = v.consumerId && typeof v.consumerId === 'object' ? v.consumerId : null;
     if (!buyer) continue;
-    const dateLabel = (() => {
-      try {
-        return new Date(v.date).toLocaleDateString('en-IN', {
-          weekday: 'short',
-          day: 'numeric',
-          month: 'short',
-        });
-      } catch {
-        return new Date(v.date).toISOString().slice(0, 10);
-      }
-    })();
+    const key = `${String(v.propertyId)}::${String(buyer._id)}`;
+    const matches = byKey.get(key) ?? [];
+    const activeMatch = matches.find(m => isActive(m.status));
+
     const modeLabel = v.mode === 'virtual' ? 'Virtual tour' : 'In-person visit';
+    const message = `${modeLabel} scheduled for ${formatVisitDate(v.date)}, ${v.timeSlot}`;
+
+    if (activeMatch) {
+      if (activeMatch.status !== 'visit_booked') {
+        toUpgrade.push({ id: activeMatch._id, message });
+      }
+      continue;
+    }
+
+    // No active lead — either no lead at all, or only terminal leads exist.
+    // Create a fresh visit_booked lead either way.
     toCreate.push({
       sellerId,
       listingId: v.propertyId,
@@ -157,12 +188,19 @@ const backfillLeadsFromVisits = async sellerId => {
       consumerName: buyer.fullName,
       consumerPhone: buyer.phone,
       consumerEmail: buyer.email,
-      message: `${modeLabel} scheduled for ${dateLabel}, ${v.timeSlot}`,
+      message,
       status: 'visit_booked',
     });
+    // Track so a second visit on the same pair in this batch doesn't
+    // create yet another duplicate within the same request.
+    matches.push({ status: 'visit_booked' });
+    byKey.set(key, matches);
   }
 
   if (toCreate.length) await Lead.insertMany(toCreate);
+  for (const u of toUpgrade) {
+    await Lead.updateOne({ _id: u.id }, { status: 'visit_booked', message: u.message });
+  }
 };
 
 exports.leads = asyncHandler(async (req, res) => {
