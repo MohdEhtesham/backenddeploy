@@ -2,6 +2,7 @@ const Inquiry = require('../models/Inquiry');
 const Property = require('../models/Property');
 const Lead = require('../models/Lead');
 const Notification = require('../models/Notification');
+const ChatThread = require('../models/ChatThread');
 const { ok, created, ApiError } = require('../utils/respond');
 const asyncHandler = require('../utils/asyncHandler');
 
@@ -47,6 +48,26 @@ exports.create = asyncHandler(async (req, res) => {
 
   // increment property counter
   Property.updateOne({ _id: property._id }, { $inc: { inquiriesCount: 1 } }).catch(() => {});
+
+  // Idempotently open a chat thread between buyer + seller for this listing
+  // (find-or-create via the compound unique index). Buyer can tap "Open
+  // chat" on the success screen and immediately land in a live thread.
+  if (property.ownerId && String(req.user._id) !== String(property.ownerId)) {
+    ChatThread.findOneAndUpdate(
+      { listingId: property._id, buyerId: req.user._id, sellerId: property.ownerId },
+      {
+        $setOnInsert: {
+          listingId: property._id,
+          listingTitle: property.title,
+          listingImage: property.images?.[0],
+          buyerId: req.user._id,
+          sellerId: property.ownerId,
+          lastMessageAt: new Date(),
+        },
+      },
+      { new: true, upsert: true },
+    ).catch(() => {});
+  }
 
   // For seller-listed properties, also create a Lead for the owner
   if (property.ownerId && property.isUserListing) {

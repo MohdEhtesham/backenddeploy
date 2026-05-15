@@ -32,17 +32,25 @@ const ROOM_PREFIX = 'visit:';
 const USER_ROOM = userId => `user:${userId}`;
 
 const attachSignaling = httpServer => {
-  const io = new Server(httpServer, {
-    cors: { origin: '*' },
-    // Long polling fallback is important for clients on flaky mobile data
-    // where the websocket upgrade can't complete. Render's free tier
-    // supports both transports.
-    transports: ['websocket', 'polling'],
-    // The default ping timeouts are tuned for browsers; tighten for mobile
-    // so a backgrounded app or dead connection is detected quickly.
-    pingInterval: 20000,
-    pingTimeout: 25000,
-  });
+  // Reuse a single Server instance across namespaces (visit-call + chat)
+  // so we don't double-bind the websocket upgrade handler on the same
+  // HTTP server. The first attach-er creates it; subsequent ones reuse.
+  let io = httpServer._io;
+  if (!io) {
+    io = new Server(httpServer, {
+      cors: { origin: '*' },
+      // Long polling fallback is important for clients on flaky mobile data
+      // where the websocket upgrade can't complete. Render's free tier
+      // supports both transports.
+      transports: ['websocket', 'polling'],
+      // The default ping timeouts are tuned for browsers; tighten for
+      // mobile so a backgrounded app or dead connection is detected
+      // quickly.
+      pingInterval: 20000,
+      pingTimeout: 25000,
+    });
+    httpServer._io = io;
+  }
 
   const ns = io.of('/visit-call');
 

@@ -21,6 +21,7 @@ const { connectDB, getStatus } = require('./config/db');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
 const { ok } = require('./utils/respond');
 const { attachSignaling } = require('./sockets/signaling');
+const { attachChatSockets } = require('./sockets/chat');
 
 const authRoutes = require('./routes/auth.routes');
 const propertyRoutes = require('./routes/property.routes');
@@ -131,6 +132,12 @@ try {
   console.log('[signaling] /visit-call namespace ready');
 } catch (e) {
   console.error('[signaling] failed to attach', e);
+}
+try {
+  attachChatSockets(server);
+  console.log('[chat] /chat namespace ready');
+} catch (e) {
+  console.error('[chat] failed to attach', e);
 }
 
 server.on('error', err => {
