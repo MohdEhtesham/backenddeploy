@@ -15,6 +15,55 @@ const ChatThread = require('../models/ChatThread');
 const { ok, ApiError } = require('../utils/respond');
 const asyncHandler = require('../utils/asyncHandler');
 
+// ---------------------------------------------------------------------------
+// First-admin bootstrap (PUBLIC — but self-disables once an admin exists)
+// ---------------------------------------------------------------------------
+//
+// Solves the chicken-and-egg of needing an admin to make admins. Until any
+// User has role='admin' in the database, this endpoint will:
+//   - find the user by `email`, OR create a new one if missing
+//   - set their role to 'admin', set the supplied password, mark active
+//   - return 200 with the public user record
+//
+// As soon as a single admin exists in the DB, the endpoint returns 403
+// permanently. No env secrets or token to leak — security is structural.
+//
+// POST /api/admin/bootstrap { email, password, fullName?, phone? }
+exports.bootstrap = asyncHandler(async (req, res) => {
+  const existingAdmin = await User.findOne({ role: 'admin' });
+  if (existingAdmin) {
+    throw new ApiError(403, 'Bootstrap is closed — an admin already exists');
+  }
+
+  const { email, password, fullName, phone } = req.body || {};
+  if (!email || !password) {
+    throw new ApiError(400, 'email and password are required');
+  }
+  if (String(password).length < 6) {
+    throw new ApiError(400, 'Password must be at least 6 characters');
+  }
+
+  const normalised = String(email).toLowerCase().trim();
+  let user = await User.findOne({ email: normalised });
+  if (user) {
+    user.role = 'admin';
+    user.suspended = false;
+    await user.setPassword(password);
+    await user.save();
+  } else {
+    user = new User({
+      email: normalised,
+      fullName: fullName || 'Aabroo Admin',
+      phone: phone || '0000000000',
+      role: 'admin',
+    });
+    await user.setPassword(password);
+    await user.save();
+  }
+
+  ok(res, user.toPublic());
+});
+
 // Shared helpers --------------------------------------------------------------
 
 const parsePaging = req => {
