@@ -2,11 +2,9 @@ const router = require('express').Router();
 const ctrl = require('../controllers/admin.controller');
 const { authRequired, roleRequired } = require('../middleware/auth');
 
-// Bootstrap (public) — only works while no admin exists in the DB.
-// Self-disabling: once any user has role='admin', subsequent calls return 403.
-router.post('/bootstrap', ctrl.bootstrap);
-
-// Every other route under /api/admin/* is locked to admins.
+// Every route under /api/admin/* is locked to admins.
+// (The public POST /api/admin/bootstrap is mounted directly on the app
+// in server.js, BEFORE this router, so it bypasses these guards.)
 router.use(authRequired, roleRequired('admin'));
 
 // Dashboard
