@@ -4,6 +4,9 @@ const Visit = require('../models/Visit');
 const Notification = require('../models/Notification');
 const { ok, created, ApiError } = require('../utils/respond');
 const asyncHandler = require('../utils/asyncHandler');
+// Per-plan listing limits are off for now (unlimited listings). The default
+// keeps that true even on a config that predates the flag.
+const { LISTING_QUOTA_ENFORCED = false } = require('../config/env');
 
 // Shape a Visit for the seller-facing API: flatten the populated buyer
 // (consumerId) into top-level buyer* fields so the mobile client doesn't
@@ -51,7 +54,7 @@ exports.listingDetail = asyncHandler(async (req, res) => {
 
 exports.createListing = asyncHandler(async (req, res) => {
   const seller = req.user.seller || {};
-  if (seller.listingQuotaUsed >= seller.listingQuotaTotal) {
+  if (LISTING_QUOTA_ENFORCED && seller.listingQuotaUsed >= seller.listingQuotaTotal) {
     throw new ApiError(402, 'Listing quota exceeded — upgrade your plan');
   }
   const draft = req.body;
