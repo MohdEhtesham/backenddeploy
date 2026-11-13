@@ -1,10 +1,37 @@
 const User = require('../models/User');
-const { signToken } = require('../utils/jwt');
 const { ok, created, ApiError } = require('../utils/respond');
 const asyncHandler = require('../utils/asyncHandler');
+const tokens = require('../modules/auth/tokens');
+const otpService = require('../modules/auth/otpService');
 
 function quotaForPlan(plan) {
   return { free: 1, basic: 10, pro: 999 }[plan] ?? 1;
+}
+
+const FREE_SELLER = { plan: 'free', listingQuotaUsed: 0, listingQuotaTotal: 1, totalLeads: 0, rating: 0 };
+
+/**
+ * The login "I am a buyer / seller" tab switches the marketplace role — but
+ * only when the client explicitly sends one (the PG app doesn't), and never
+ * for platform admins, who would otherwise silently lose admin access.
+ */
+async function applyRequestedRole(user, role) {
+  if (!role || role === user.role || user.role === 'admin') return;
+  user.role = role;
+  if (role === 'seller' && !user.seller?.plan) user.seller = { ...FREE_SELLER };
+  await user.save();
+}
+
+/** Legacy `{ user, token }` plus refresh-token fields for newer clients. */
+async function authPayload(user, req, extra = {}) {
+  const session = await tokens.issueSession(user, req);
+  return {
+    ...extra,
+    user: user.toPublic(),
+    token: session.token,
+    accessTokenExpiresAt: session.accessTokenExpiresAt,
+    refreshToken: session.refreshToken,
+  };
 }
 
 exports.signup = asyncHandler(async (req, res) => {
@@ -18,13 +45,12 @@ exports.signup = asyncHandler(async (req, res) => {
     email,
     phone,
     role,
-    seller: { plan: 'free', listingQuotaUsed: 0, listingQuotaTotal: 1, totalLeads: 0, rating: 0 },
+    seller: { ...FREE_SELLER },
   });
   await user.setPassword(password);
   await user.save();
 
-  const token = signToken({ sub: user._id.toString(), role: user.role });
-  created(res, { user: user.toPublic(), token });
+  created(res, await authPayload(user, req));
 });
 
 exports.login = asyncHandler(async (req, res) => {
@@ -37,28 +63,21 @@ exports.login = asyncHandler(async (req, res) => {
 
   const okPass = await user.checkPassword(password);
   if (!okPass) throw new ApiError(401, 'Invalid credentials');
+  if (user.suspended) throw new ApiError(403, 'This account has been suspended.');
 
-  // Mirror frontend role-tab UX: if user picks a role on login, switch into it
-  if (role && role !== user.role) {
-    user.role = role;
-    if (role === 'seller' && !user.seller?.plan) {
-      user.seller = { plan: 'free', listingQuotaUsed: 0, listingQuotaTotal: 1, totalLeads: 0, rating: 0 };
-    }
-    await user.save();
-  }
+  await applyRequestedRole(user, role);
 
-  const token = signToken({ sub: user._id.toString(), role: user.role });
-  ok(res, { user: user.toPublic(), token });
+  ok(res, await authPayload(user, req));
 });
 
-// MOCK OTP — always succeeds with 1234. Replace with real SMS provider later.
-exports.sendOtp = asyncHandler(async (_req, res) => {
-  ok(res, { sent: true, otp: '1234' }, 'OTP sent (mock — use 1234)');
+exports.sendOtp = asyncHandler(async (req, res) => {
+  const result = await otpService.sendOtp(req.body.phone, { ip: req.ip });
+  ok(res, result, result.otp ? `OTP sent (demo mode — use ${result.otp})` : 'OTP sent');
 });
 
 exports.verifyOtp = asyncHandler(async (req, res) => {
-  const { phone, otp, role = 'consumer' } = req.body;
-  if (otp !== '1234') throw new ApiError(401, 'Invalid OTP');
+  const { phone, otp, role } = req.body;
+  await otpService.verifyOtp(phone, otp);
 
   let user = await User.findOne({ phone });
   if (!user) {
@@ -67,18 +86,27 @@ exports.verifyOtp = asyncHandler(async (req, res) => {
       fullName: 'New User',
       email: `${phone}@aabroo.app`,
       phone,
-      role,
-      seller: { plan: 'free', listingQuotaUsed: 0, listingQuotaTotal: 1, totalLeads: 0, rating: 0 },
+      role: role || 'consumer',
+      seller: { ...FREE_SELLER },
     });
-    await user.setPassword(Math.random().toString(36).slice(2));
+    await user.setPassword(require('crypto').randomBytes(24).toString('base64url'));
     await user.save();
-  } else if (role && role !== user.role) {
-    user.role = role;
-    await user.save();
+  } else {
+    if (user.suspended) throw new ApiError(403, 'This account has been suspended.');
+    await applyRequestedRole(user, role);
   }
 
-  const token = signToken({ sub: user._id.toString(), role: user.role });
-  ok(res, { valid: true, user: user.toPublic(), token });
+  ok(res, await authPayload(user, req, { valid: true }));
+});
+
+exports.refresh = asyncHandler(async (req, res) => {
+  const result = await tokens.rotateRefreshToken(req.body.refreshToken);
+  ok(res, {
+    user: result.user.toPublic(),
+    token: result.token,
+    accessTokenExpiresAt: result.accessTokenExpiresAt,
+    refreshToken: result.refreshToken,
+  });
 });
 
 exports.forgotPassword = asyncHandler(async (_req, res) => {
@@ -90,7 +118,48 @@ exports.me = asyncHandler(async (req, res) => {
   ok(res, req.user.toPublic());
 });
 
-exports.logout = asyncHandler(async (_req, res) => {
+exports.logout = asyncHandler(async (req, res) => {
+  if (req.auth?.sessionId) await tokens.revokeSession(req.auth.sessionId, 'logout');
+  // Clients may also pass their refresh token to end that session.
+  const rt = req.body && typeof req.body.refreshToken === 'string' ? req.body.refreshToken : '';
+  const sid = rt.includes('.') ? rt.slice(0, rt.indexOf('.')) : '';
+  if (sid) {
+    const owned = (await tokens.listSessions(req.user._id)).some(s => String(s._id) === sid);
+    if (owned) await tokens.revokeSession(sid, 'logout');
+  }
+  // Stop pushing to this device once signed out.
+  const deviceToken = req.body && typeof req.body.deviceToken === 'string' ? req.body.deviceToken : '';
+  if (deviceToken) {
+    const DeviceToken = require('../modules/notifications/DeviceToken');
+    await DeviceToken.deleteOne({ token: deviceToken, userId: req.user._id });
+  }
+  ok(res, { success: true });
+});
+
+exports.logoutAll = asyncHandler(async (req, res) => {
+  await tokens.revokeAllSessions(req.user._id, 'logout_all');
+  ok(res, { success: true });
+});
+
+exports.sessions = asyncHandler(async (req, res) => {
+  const rows = await tokens.listSessions(req.user._id);
+  ok(
+    res,
+    rows.map(s => ({
+      id: s._id,
+      userAgent: s.userAgent,
+      platform: s.platform,
+      lastUsedAt: s.lastUsedAt,
+      createdAt: s.createdAt,
+      current: String(s._id) === String(req.auth?.sessionId || ''),
+    })),
+  );
+});
+
+exports.revokeSession = asyncHandler(async (req, res) => {
+  const rows = await tokens.listSessions(req.user._id);
+  if (!rows.some(s => String(s._id) === req.params.id)) throw new ApiError(404, 'Session not found');
+  await tokens.revokeSession(req.params.id, 'revoked_by_user');
   ok(res, { success: true });
 });
 
@@ -106,9 +175,10 @@ exports.updateProfile = asyncHandler(async (req, res) => {
 exports.setRole = asyncHandler(async (req, res) => {
   const role = req.body.role;
   if (!['consumer', 'seller'].includes(role)) throw new ApiError(400, 'Invalid role');
+  if (req.user.role === 'admin') throw new ApiError(400, 'Admin accounts cannot switch role');
   req.user.role = role;
   if (role === 'seller' && !req.user.seller?.plan) {
-    req.user.seller = { plan: 'free', listingQuotaUsed: 0, listingQuotaTotal: 1, totalLeads: 0, rating: 0 };
+    req.user.seller = { ...FREE_SELLER };
   }
   await req.user.save();
   ok(res, req.user.toPublic());
@@ -116,7 +186,6 @@ exports.setRole = asyncHandler(async (req, res) => {
 
 exports.deleteAccount = asyncHandler(async (req, res) => {
   const userId = req.user._id;
-  // Cascade-delete all data owned by this user.
   // Lazy-required to avoid circular imports.
   const Inquiry = require('../models/Inquiry');
   const Visit = require('../models/Visit');
@@ -124,7 +193,23 @@ exports.deleteAccount = asyncHandler(async (req, res) => {
   const Notification = require('../models/Notification');
   const ChatThread = require('../models/ChatThread');
   const Property = require('../models/Property');
+  const OrganizationUser = require('../modules/saas/models/OrganizationUser');
+  const DeviceToken = require('../modules/notifications/DeviceToken');
+  const Tenant = require('../modules/pg/models/Tenant');
+  const { unscoped } = require('../modules/core/scope');
 
+  // A PG organization must never be left without an owner.
+  const ownerships = await unscoped(() =>
+    OrganizationUser.countDocuments({ userId, role: 'OWNER', status: 'ACTIVE' }),
+  );
+  if (ownerships > 0) {
+    throw new ApiError(
+      409,
+      'You own a PG organization. Transfer ownership or close the organization before deleting your account.',
+    );
+  }
+
+  // Cascade-delete all data owned by this user.
   await Promise.all([
     Inquiry.deleteMany({ consumerId: userId }),
     Visit.deleteMany({ consumerId: userId }),
@@ -133,6 +218,11 @@ exports.deleteAccount = asyncHandler(async (req, res) => {
     ChatThread.deleteMany({ userId }),
     // Only seller-uploaded listings — never touch curated catalog
     Property.deleteMany({ ownerId: userId, isUserListing: true }),
+    DeviceToken.deleteMany({ userId }),
+    tokens.revokeAllSessions(userId, 'account_deleted'),
+    // PG records belong to the organization; only unlink the login.
+    unscoped(() => OrganizationUser.deleteMany({ userId })),
+    unscoped(() => Tenant.updateMany({ userId }, { $set: { userId: null } })),
   ]);
 
   await req.user.deleteOne();

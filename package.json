@@ -1,17 +1,21 @@
 {
   "name": "aabroo-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Aabroo real-estate marketplace backend (Node + Express + MongoDB)",
+  "description": "Aabroo backend — property marketplace + PG/Hostel management SaaS (Node + Express + MongoDB)",
   "main": "src/server.js",
   "type": "commonjs",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "seed": "node src/seed/seed.js"
+    "seed": "node src/seed/seed.js",
+    "seed:pg": "node src/seed/seed-pg.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
+    "test:unit": "node --test test/unit.test.js",
+    "jobs:run": "node -e \"require('./src/config/db').connectDB().then(()=>require('./src/modules/jobs/scheduler').runAll()).then(r=>{console.log(JSON.stringify(r,null,2));process.exit(0)}).catch(e=>{console.error(e);process.exit(1)})\""
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -30,6 +34,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "mongodb-memory-server-core": "^11.3.0",
     "nodemon": "^3.1.7"
   }
 }

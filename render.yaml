@@ -1,4 +1,7 @@
 services:
+  # Staging / test deployment (the one the mobile app points at today).
+  # For production, create a second service from this blueprint with
+  # APP_ENV=production and the values from .env.production.example.
   - type: web
     name: aabroo-api
     runtime: node
@@ -10,14 +13,21 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: APP_ENV
+        value: staging
       # PORT is automatically set by Render — do NOT hardcode it here.
       # The app reads process.env.PORT and listens on whatever Render allocates.
+      # PUBLIC_API_URL defaults to RENDER_EXTERNAL_URL (set by Render).
       - key: MONGODB_URI
         sync: false
       - key: JWT_SECRET
         generateValue: true
       - key: JWT_EXPIRES_IN
         value: 30d
+      - key: ACCESS_TOKEN_TTL
+        value: 1h
+      - key: FILE_URL_SECRET
+        generateValue: true
       - key: CORS_ORIGINS
         value: '*'
       - key: CLOUDINARY_CLOUD_NAME
@@ -28,3 +38,19 @@ services:
         sync: false
       - key: RATE_LIMIT_MAX
         value: 300
+      # Demo OTP (1234) until an SMS provider is configured.
+      - key: OTP_MODE
+        value: fixed
+      # Online payments turn on once all three Razorpay values are set.
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: JOBS_ENABLED
+        value: 'true'
+      # Lets an external scheduler call POST /api/internal/jobs/all
+      # (free instances sleep, so the in-process scheduler is best-effort).
+      - key: CRON_SECRET
+        generateValue: true

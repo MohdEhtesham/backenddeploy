@@ -8,7 +8,9 @@ function validate(schema, source = 'body') {
       req[source] = parsed;
       next();
     } catch (e) {
-      next(new ApiError(400, 'Validation failed', e?.issues || e?.errors || e?.message));
+      const err = new ApiError(400, 'Validation failed', e?.issues || e?.errors || e?.message);
+      err.code = 'VALIDATION_ERROR';
+      next(err);
     }
   };
 }

@@ -8,3 +8,10 @@ yarn-error.log*
 *.log
 coverage/
 dist/
+
+# Private document storage (local driver) — never commit tenant KYC files
+storage/
+
+# Environment files (only the *.example templates are committed)
+.env.*
+!.env*.example

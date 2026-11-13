@@ -17,7 +17,7 @@
 //                     typing { threadId, by, on } (Chunk B)
 
 const { Server } = require('socket.io');
-const { verifyToken } = require('../utils/jwt');
+const { verifySocketToken } = require('../modules/auth/socketAuth');
 const ChatThread = require('../models/ChatThread');
 
 const USER_ROOM = userId => `user:${userId}`;
@@ -48,7 +48,7 @@ const attachChatSockets = httpServer => {
     try {
       const token = socket.handshake.auth?.token || socket.handshake.query?.token;
       if (!token) return next(new Error('Missing auth token'));
-      const payload = verifyToken(token);
+      const payload = await verifySocketToken(token);
       const userId = payload.sub || payload.id || payload._id;
       if (!userId) return next(new Error('Invalid token payload'));
       socket.data.userId = String(userId);
@@ -103,9 +103,21 @@ const attachChatSockets = httpServer => {
 // Helper used by REST controllers (sendMessage) to fan out new messages
 // over both the thread room (active subscribers) and each member's user
 // room (push to anyone with the app open but not on that thread yet).
+//
+// We emit `message` to BOTH the thread room AND each member's user room.
+// The client's global socket bridge only joins user rooms (it doesn't
+// know which threads the user is viewing), so without the user-room
+// emit, peer messages would never reach the bridge's `socket.on('message')`
+// listener — meaning new messages from the peer wouldn't show up in the
+// active chat until the user re-opened the screen. The client-side slice
+// dedupes by message id so the dual emit is safe.
 const broadcastMessage = ({ threadId, buyerId, sellerId, message }) => {
   if (!nsRef) return;
   nsRef.to(THREAD_ROOM(threadId)).emit('message', message);
+  nsRef.to(USER_ROOM(buyerId)).emit('message', message);
+  nsRef.to(USER_ROOM(sellerId)).emit('message', message);
+  // Keep thread-touched as a lighter signal for clients that want to
+  // refresh the threads list without binding the full message into state.
   nsRef.to(USER_ROOM(buyerId)).emit('thread-touched', { threadId, message });
   nsRef.to(USER_ROOM(sellerId)).emit('thread-touched', { threadId, message });
 };

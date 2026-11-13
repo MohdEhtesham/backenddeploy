@@ -23,7 +23,7 @@
 //   error         { message }                 → fatal error; client should close the call
 
 const { Server } = require('socket.io');
-const { verifyToken } = require('../utils/jwt');
+const { verifySocketToken } = require('../modules/auth/socketAuth');
 const Visit = require('../models/Visit');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
@@ -58,7 +58,7 @@ const attachSignaling = httpServer => {
     try {
       const token = socket.handshake.auth?.token || socket.handshake.query?.token;
       if (!token) return next(new Error('Missing auth token'));
-      const payload = verifyToken(token);
+      const payload = await verifySocketToken(token);
       const userId = payload.sub || payload.id || payload._id;
       if (!userId) return next(new Error('Invalid token payload'));
       socket.data.userId = String(userId);

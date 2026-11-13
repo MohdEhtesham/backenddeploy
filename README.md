@@ -178,11 +178,45 @@ export const USE_MOCK = false; // toggle to false to hit real API
 
 When `USE_MOCK=true`, services use the in-app mock data (no network calls). Useful for offline dev and demos.
 
+## PG / Hostel SaaS API (`/api/pg/*`)
+
+A multi-tenant PG / hostel management platform is built on the same server. The code lives in `src/modules/*`.
+
+| Area | Endpoints |
+|---|---|
+| Context & onboarding | `GET /pg/me/context`, `POST /pg/organizations`, `/pg/me/invitations` |
+| Organization & team | `/pg/organization` (+ `/settings`, `/usage`, `/audit-logs`), `/pg/users` (invite, roles, scope) |
+| Structure | `/pg/properties`, `/pg/buildings`, `/pg/floors`, `/pg/rooms` (+ `/:id/beds`), `/pg/beds` (+ `/:id/status`), `/pg/amenities` |
+| Tenants | `/pg/tenants` (+ notice, transfer, ledger), `/pg/documents` (private, signed URLs), `/pg/checkins`, `/pg/checkouts` (+ `/preview`), `/pg/agreements`, `/pg/rents` |
+| Money | `/pg/invoices` (+ generate, cancel, waive late fee), `/pg/payments` (Idempotency-Key, receipts, refunds), `/pg/refunds`, `/pg/expenses`, `/pg/expense-categories` |
+| Operations | `/pg/complaints`, `/pg/maintenance`, `/pg/work`, `/pg/staff`, `/pg/attendance`, `/pg/visitors`, `/pg/notices`, `/pg/mess` |
+| Insights | `/pg/dashboard`, `/pg/reports/:name` (JSON or `format=csv`), `/pg/notifications` |
+| Resident app | `/pg/me/*`: stay, invoices, online payments, complaints, visitor passes, documents, agreement, mess, notice |
+| SaaS | `/pg/subscription` (plans, quote, checkout, cancel/resume), `/pg/support/tickets`, `/pg/admin/*` (super admin) |
+| Platform | `/api/webhooks/razorpay`, `/api/payments/return`, `/api/devices`, `/api/analytics/events`, `/api/files/:token`, `/api/internal/jobs/:name`, `/.well-known/*` |
+
+The full OpenAPI 3 spec is generated from the Zod DTOs. Browse it at **`/api/docs`**, or fetch the JSON from `/api/docs/openapi.json`.
+
+### Guarantees
+- **Tenant isolation.** Every PG/SaaS document carries `organizationId`, and a Mongoose plugin rejects any query without it. The org comes from the `X-Org-Id` header and is accepted only after the server finds an active membership. Role, permissions and property scope are always read from the database.
+- **No double booking.** Beds are claimed atomically, and unique partial indexes allow only one active allocation per bed and per tenant. Check-in, transfer and check-out run in transactions.
+- **Payments.** Online payments settle only through the HMAC-verified webhook (idempotent per event) or a server-to-server gateway check, and the amount is verified against the server's own record. Offline payments need `payment.record` and support an `Idempotency-Key`.
+- **Subscriptions.** Plan, trial, grace and expiry rules are data edited by the super admin. Writes are blocked when a plan lapses, and creation is blocked at plan limits.
+
+### Scripts
+```bash
+npm run seed:pg          # demo orgs, properties, beds, tenants, invoices, payments … (--reset to recreate)
+npm test                 # 100+ tests on an in-memory MongoDB replica set (no external services)
+npm run jobs:run         # run the scheduled jobs once (invoices, overdue, reminders, subscriptions)
+```
+
+Environment templates: `.env.example` (development), `.env.staging.example` and `.env.production.example`. Production refuses to boot with unsafe settings: a fixed OTP, local storage, or short secrets.
+
 ## Production hardening checklist
-- [ ] Replace mock OTP with Twilio / MSG91 / similar
+- [x] Hashed, rate-limited OTP with pluggable SMS providers (`OTP_MODE=random`, MSG91 / Twilio)
 - [ ] Hook Cloudinary moderation API for uploaded images
-- [ ] Add Razorpay/Stripe for actual seller plan billing
+- [x] Razorpay payment links for rent and SaaS plans (configure keys + webhook secret)
 - [ ] Switch JWT to httpOnly cookies for web clients
 - [ ] Add Sentry for error tracking
 - [ ] Tighten `CORS_ORIGINS` to your real app/web origins
-- [ ] Rate-limit `/auth/login` and `/auth/otp/*` more aggressively
+- [x] Stricter rate limits on `/auth/*` and OTP endpoints

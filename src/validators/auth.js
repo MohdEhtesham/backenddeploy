@@ -22,12 +22,16 @@ const otpRequestSchema = z.object({
 
 const otpVerifySchema = z.object({
   phone: z.string().regex(phoneRegex),
-  otp: z.string().length(4),
+  otp: z.string().regex(/^\d{4,8}$/, 'Invalid OTP'),
   role: z.enum(['consumer', 'seller']).optional(),
 });
 
 const forgotSchema = z.object({
   identifier: z.string().min(3),
+});
+
+const refreshSchema = z.object({
+  refreshToken: z.string().min(20).max(300),
 });
 
 module.exports = {
@@ -36,4 +40,5 @@ module.exports = {
   otpRequestSchema,
   otpVerifySchema,
   forgotSchema,
+  refreshSchema,
 };
